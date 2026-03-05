@@ -1,0 +1,190 @@
+esphome:
+  name: ahoi-wmbus-sniffer-t3s3-sx1276
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # Disable SPIRAM for stability as it is not needed for this project
+      CONFIG_ESP32S3_SPIRAM_SUPPORT: "n"
+      CONFIG_SPIRAM: "n"
+
+ota:
+  - platform: esphome
+
+api:
+
+wifi:
+  id: wifi_component
+  networks:
+    # --- CONFIGURE YOUR WIFI HERE ---
+    - ssid: "YOUR_WIFI_SSID"
+      password: "YOUR_WIFI_PASSWORD"
+    # Add more networks if needed
+    # - ssid: "Backup_WiFi"
+    #   password: "password"
+  ap:
+    ssid: "AHOI_WMBUS_Recovery"
+
+mqtt:
+  # --- CONFIGURE YOUR MQTT BROKER HERE ---
+  broker: "YOUR_MQTT_BROKER_IP"
+  topic_prefix: "ahoi/wmbus"
+
+external_components:
+  # Using custom fork to ensure stability with SX1276 (frozen version)
+  # This points to this specific repository to avoid breaking changes from upstream
+  - source: github://istefan/wmbus1276@main
+    components: [ wmbus_radio, wmbus_common ]
+    refresh: 0s
+
+logger:
+  level: INFO
+
+# --- SPI CONFIGURATION (LILYGO T3S3) ---
+spi:
+  clk_pin: 5
+  mosi_pin: 6
+  miso_pin: 3
+
+# --- BATTERY SENSOR ---
+sensor:
+  - platform: adc
+    pin: 1
+    name: "Battery Voltage"
+    id: bat_voltage
+    attenuation: 12db
+    update_interval: 60s
+    filters:
+      # Compensate for the 1:1 voltage divider on the board
+      - multiply: 2.0
+    on_value:
+      then:
+        - component.update: my_display
+
+  - platform: template
+    name: "Battery Level"
+    id: bat_level
+    unit_of_measurement: "%"
+    lambda: |-
+      if (std::isnan(id(bat_voltage).state)) return 0.0;
+      // Linear calculation: 3.0V = 0%, 4.2V = 100%
+      float percentage = (id(bat_voltage).state - 3.00) / (4.20 - 3.00) * 100.0;
+      if (percentage > 100.0) return 100.0;
+      if (percentage < 0.0) return 0.0;
+      return percentage;
+
+binary_sensor:
+  - platform: template
+    id: packet_indicator
+
+# --- RADIO CONFIGURATION (SX1276) ---
+wmbus_radio:
+  radio_type: SX1276
+  cs_pin: 7
+  reset_pin: 8
+  irq_pin: 33
+  # SX1276 does not use a BUSY pin on this board
+  
+  on_frame:
+      - then:
+          - binary_sensor.template.publish:
+              id: packet_indicator
+              state: ON
+          - mqtt.publish:
+              topic: "ahoi/wmbus/raw"
+              payload: !lambda >
+                return get_mac_address() + ":" + frame->as_hex() + ":" + std::to_string(frame->rssi());
+          - delay: 0.2s 
+          - binary_sensor.template.publish:
+              id: packet_indicator
+              state: OFF
+
+wmbus_common:
+
+i2c:
+  sda: 18
+  scl: 17
+  frequency: 400kHz
+
+# --- FONTS ---
+font:
+  - file: "gfonts://Roboto"
+    id: font_main
+    size: 18
+
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 12
+
+  - file: "gfonts://Material Icons"
+    id: font_icon
+    size: 18
+    glyphs: "\ue63e" # Wi-Fi Icon
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    id: my_display
+    lambda: |-
+      // --- LINE 1: TITLE ---
+      it.print(0, 0, id(font_main), "AHOI READER");
+
+      // --- LINE 2: DEVICE ID ---
+      std::string mac = get_mac_address();
+      for (auto & c: mac) c = toupper(c);
+      it.printf(0, 20, id(font_small), "ID: %s", mac.c_str());
+
+      // --- LINE 3: BATTERY INFO ---
+      // Voltage Text
+      if (id(bat_voltage).has_state()) {
+        it.printf(0, 34, id(font_small), "BAT: %.2fV", id(bat_voltage).state);
+      } else {
+        it.print(0, 34, id(font_small), "BAT: --.--V");
+      }
+
+      // Vertical Battery Icon
+      int bat_x = 110;
+      int bat_y = 20;
+      int bat_w = 12;
+      int bat_h = 22;
+      
+      // Outline
+      it.rectangle(bat_x, bat_y, bat_w, bat_h);
+      // Terminal (top nub)
+      it.filled_rectangle(bat_x + 3, bat_y - 2, 6, 2);
+
+      // Calculate Bars
+      float pct = id(bat_level).state;
+      int bars = 0;
+      if (pct > 10) bars = 1;
+      if (pct > 30) bars = 2;
+      if (pct > 50) bars = 3;
+      if (pct > 70) bars = 4;
+      if (pct > 90) bars = 5;
+
+      // Draw Bars
+      for (int i = 0; i < bars; i++) {
+        int bar_h = 3; 
+        int gap = 1;
+        int current_y = (bat_y + bat_h) - 2 - bar_h - (i * (bar_h + gap));
+        it.filled_rectangle(bat_x + 2, current_y, bat_w - 4, bar_h);
+      }
+
+      // --- LINE 4: SEPARATOR ---
+      it.line(0, 48, 127, 48); 
+
+      // --- LINE 5: STATUS & WI-FI ---
+      if (id(wifi_component).is_connected()) {
+        it.print(0, 50, id(font_icon), "\ue63e"); 
+        
+        if (id(packet_indicator).state) {
+          it.print(24, 50, id(font_small), "RX ACTIV!"); 
+        } else {
+          it.print(24, 50, id(font_small), "Listening...");
+        }
+      } else {
+        it.print(0, 50, id(font_small), "No WiFi");
+      }
